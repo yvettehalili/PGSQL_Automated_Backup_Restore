@@ -1,76 +1,63 @@
 #!/usr/bin/python3.5
 
 import os
-import time
 import subprocess
 import datetime
-import logging
 import configparser
 import io
+import time
+import logging
 from google.cloud import storage
 
-# Backup and log path
+# Constants and paths
 BUCKET = "ti-sql-02"
-GCS_PATH = "Backups/Current/PGSQL"
+GCS_PATH = "Backups/Current/POSTGRESQL"
 SSL_PATH = "/ssl-certs/"
-SERVERS_LIST = "/backup/configs/PGSQL_servers_list.conf"
 KEY_FILE = "/root/jsonfiles/ti-ca-infrastructure-d1696a20da16.json"
 
-# Define the path for the database credentials
+# Define the path for the database credentials and load them
 CREDENTIALS_PATH = "/backup/configs/db_credentials.conf"
-
-# Logging Configuration
-log_path = "/backup/logs/"
-os.makedirs(log_path, exist_ok=True)
-current_date = datetime.datetime.now().strftime("%Y-%m-%d")
-log_filename = os.path.join(log_path, "PGSQL_backup_activity_{}.log".format(current_date))
-logging.basicConfig(filename=log_filename, level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
-
-# Load Database credentials
 config = configparser.ConfigParser()
 config.read(CREDENTIALS_PATH)
 DB_USR = config['credentials']['DB_USR']
 DB_PWD = config['credentials']['DB_PWD']
 
-def load_server_list(file_path):
-    """Load the server list from a given file."""
-    config = configparser.ConfigParser()
+# Set environment variable for PostgreSQL password
+os.environ["PGPASSWORD"] = DB_PWD
+
+# Log file path
+LOG_FILE_BASE_PATH = "/backup/logs/PGSQL_backup_activity"
+CURRENT_DATE = datetime.datetime.now().strftime("%Y-%m-%d")
+LOG_FILE_PATH = "{}_{}.log".format(LOG_FILE_BASE_PATH, CURRENT_DATE)
+
+# Specific database roles
+DB_ROLES = {
+    "db_datti": "GenBackupUser",
+    "db_gtt_historic_data": "GenBackupUser"
+}
+
+def log_to_file(message):
+    """Write messages to the log file with a timestamp."""
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(LOG_FILE_PATH, "a") as log_file:
+        log_file.write("{}: {}\n".format(timestamp, message))
+
+def run_command(command, env=None):
+    """Run a command and return its success."""
     try:
-        config.read(file_path)
-        return config.sections(), config
-    except Exception as e:
-        logging.error("Failed to load server list: {}".format(e))
-        return [], None
-
-def get_database_list(host, use_ssl, server):
-    """Retrieve the list of databases from the PostgreSQL server."""
-    try:
-        if not use_ssl:
-            command = [
-                "psql", "-U", DB_USR, "-h", host, "-lqt"
-            ]
-        else:
-            command = [
-                "psql", "-U", DB_USR, "-h", host, "--set=sslmode=verify-ca",
-                "--set=sslrootcert=" + os.path.join(SSL_PATH, server, "server-ca.pem"),
-                "--set=sslcert=" + os.path.join(SSL_PATH, server, "client-cert.pem"),
-                "--set=sslkey=" + os.path.join(SSL_PATH, server, "client-key.pem"), "-lqt"
-            ]
-
-        result = subprocess.check_output(command, stderr=subprocess.STDOUT)
-        db_list = result.decode("utf-8").strip().split('\n')
-        valid_db_list = [
-            db.split('|')[0].strip() for db in db_list if db.split('|')[0].strip() not in (
-                "postgres", "template0", "template1"
-            )
-        ]
-
-        return valid_db_list
+        subprocess.check_call(command, shell=True, env=env or os.environ)
+        return True
     except subprocess.CalledProcessError as e:
-        logging.error("Failed to get database list from {}: {} - Output: {}".format(
-            host, e, e.output.decode()
-        ))
-        return []
+        log_to_file("Command failed: {}\nError message: {}".format(command, e))
+        return False
+
+def run_command_capture(command, env=None):
+    """Run a command and capture its output and error messages."""
+    try:
+        output = subprocess.check_output(command, shell=True, stderr=subprocess.STDOUT, env=env or os.environ)
+        return True, output.decode()
+    except subprocess.CalledProcessError as e:
+        return False, e.output.decode()
 
 # Stream database to GCS
 def stream_database_to_gcs(dump_command, gcs_path, db):
@@ -82,11 +69,6 @@ def stream_database_to_gcs(dump_command, gcs_path, db):
         # Start the dump process
         dump_proc = subprocess.Popen(dump_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-        logging.info("Starting gzip process")
-        # Start the gzip process
-        gzip_proc = subprocess.Popen(["gzip"], stdin=dump_proc.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        dump_proc.stdout.close()  # Allow dump_proc to receive a SIGPIPE if gzip_proc exits
-
         # Initialize Google Cloud Storage client
         client = storage.Client.from_service_account_json(KEY_FILE)
         bucket = client.bucket(BUCKET)
@@ -94,11 +76,11 @@ def stream_database_to_gcs(dump_command, gcs_path, db):
 
         logging.info("Starting GCS upload process")
         with io.BytesIO() as memfile:
-            for chunk in iter(lambda: gzip_proc.stdout.read(4096), b''):
+            for chunk in iter(lambda: dump_proc.stdout.read(4096), b''):
                 memfile.write(chunk)
 
             memfile.seek(0)
-            blob.upload_from_file(memfile, content_type='application/gzip')
+            blob.upload_from_file(memfile, content_type='application/octet-stream')
 
         elapsed_time = time.time() - start_time
         logging.info("Dumped and streamed database {} to GCS successfully in {:.2f} seconds.".format(db, elapsed_time))
@@ -107,47 +89,61 @@ def stream_database_to_gcs(dump_command, gcs_path, db):
         logging.error("Unexpected error streaming database {} to GCS: {}".format(db, e))
 
 def main():
-    """Main function to execute the backup process."""
-    current_date = datetime.datetime.now().strftime("%Y-%m-%d")
+    # Initialize the configuration parser and load the server configurations
+    server_config = configparser.ConfigParser()
+    server_config.read('/backup/configs/PGSQL_servers_list.conf')
 
-    sections, config = load_server_list(SERVERS_LIST)
-    if not sections:
-        logging.error("No servers to process. Exiting.")
-        return
+    log_to_file("================================== {} =============================================".format(CURRENT_DATE))
 
-    logging.info("================================== {} =============================================".format(current_date))
-    logging.info("==== Backup Process Started ====")
+    # Read server configurations into a list of tuples
     servers = []
-    for section in sections:
-        try:
-            host = config[section]['host']
-            ssl = config[section].get('ssl', 'n')  # Provide default value 'n' if 'ssl' key is missing
-            servers.append((section, host, ssl))
-        except KeyError as e:
-            logging.error("Missing configuration for server '{}': {}".format(section, e))
+    for section in server_config.sections():
+        SERVER = section
+        HOST = server_config.get(section, 'host')
+        SSL = server_config.get(section, 'ssl')
+        servers.append((SERVER, HOST, SSL))
 
     for server in servers:
         SERVER, HOST, SSL = server
-        use_ssl = SSL.lower() == "y"
-        logging.info("DUMPING SERVER: {}".format(SERVER))
+        DB_HOST = HOST
+
+        log_to_file("DUMPING SERVER: {}".format(SERVER))
+
+        if SSL == 'n':
+            dbs_command = ("psql -h {} -U {} -d postgres -t -c 'SELECT datname FROM pg_database WHERE datistemplate = false;'"
+                            ).format(DB_HOST, DB_USR)
+        else:
+            dbs_command = (
+                "psql \"sslmode=verify-ca sslrootcert={}{}{} sslcert={}{}{} sslkey={}{}{} hostaddr={} user={} dbname=postgres\" "
+                "-t -c 'SELECT datname FROM pg_database WHERE datistemplate = false;'"
+            ).format(SSL_PATH, SERVER, "/server-ca.pem", SSL_PATH, SERVER, "/client-cert.pem",
+                    SSL_PATH, SERVER, "/client-key.pem", DB_HOST, DB_USR)
 
         try:
-            db_list = get_database_list(HOST, use_ssl, SERVER)
-            if not db_list:
-                logging.warning("No databases found for server: {}".format(SERVER))
-                continue
+            dbs_output = subprocess.check_output(dbs_command, shell=True, env=os.environ).decode().splitlines()
+            dbs_output = [db.strip() for db in dbs_output if db.strip()]
+        except subprocess.CalledProcessError as e:
+            log_to_file("Failed to fetch databases from server {}: {}".format(SERVER, e))
+            continue
 
-            for db in db_list:
-                logging.info("Backing up database: {}".format(db))
-                gcs_path = os.path.join(GCS_PATH, SERVER, "{}_{}.sql.gz".format(current_date, db))
-                
-                if use_ssl:
-                    dump_command = [
+        for DB in dbs_output:
+            if DB not in ["template0", "template1", "restore", "postgres", "cloudsqladmin"]:
+                log_to_file("Dumping DB {}".format(DB))
+
+                # Determine the role for the specific database
+                role = DB_ROLES.get(DB, "postgres")
+
+                # Construct the pg_dump command based on SSL status
+                if SSL == 'y':
+                    pg_dump_command = [
                         "pg_dump",
                         "sslmode=verify-ca user={} hostaddr={} sslrootcert={} sslcert={} sslkey={} dbname={}".format(
-                            DB_USR, HOST, os.path.join(SSL_PATH, SERVER, "server-ca.pem"),
+                            DB_USR,
+                            DB_HOST,
+                            os.path.join(SSL_PATH, SERVER, "server-ca.pem"),
                             os.path.join(SSL_PATH, SERVER, "client-cert.pem"),
-                            os.path.join(SSL_PATH, SERVER, "client-key.pem"), db
+                            os.path.join(SSL_PATH, SERVER, "client-key.pem"),
+                            DB
                         ),
                         "--role=postgres",
                         "--no-owner",
@@ -155,22 +151,22 @@ def main():
                         "-Fc"
                     ]
                 else:
-                    dump_command = [
+                    pg_dump_command = [
                         "pg_dump",
-                        "postgresql://{}:{}@{}:5432/{}".format(DB_USR, DB_PWD, HOST, db),
+                        "postgresql://{}@{}:5432/{}".format(DB_USR, DB_HOST, DB),
                         "--role=postgres",
                         "--no-owner",
                         "--no-acl",
                         "-Fc"
                     ]
 
-                logging.info("Dump command: {}".format(" ".join(dump_command)))
-                stream_database_to_gcs(dump_command, gcs_path, db)
+                gcs_path = "{}/{}/{}_{}.dump".format(GCS_PATH, SERVER, CURRENT_DATE, DB)
+                if stream_database_to_gcs(pg_dump_command, gcs_path, DB):
+                    log_to_file("Successfully backed up and streamed {} from server {} to GCS".format(DB, SERVER))
+                else:
+                    log_to_file("Failed to backup and stream {} from server {}".format(DB, SERVER))
 
-        except Exception as e:
-            logging.error("Error processing server {}: {}".format(SERVER, e))
-
-    logging.info("==== Backup Process Completed ====")
+    log_to_file("============================================================================================")
 
 if __name__ == "__main__":
     main()
