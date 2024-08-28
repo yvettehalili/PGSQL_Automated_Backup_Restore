@@ -69,24 +69,41 @@ def stream_database_to_gcs(dump_command, gcs_path, db):
         # Start the dump process
         dump_proc = subprocess.Popen(dump_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-        # Initialize Google Cloud Storage client
+        stderr_output = io.BytesIO()
         client = storage.Client.from_service_account_json(KEY_FILE)
         bucket = client.bucket(BUCKET)
         blob = bucket.blob(gcs_path)
 
         logging.info("Starting GCS upload process")
         with io.BytesIO() as memfile:
-            for chunk in iter(lambda: dump_proc.stdout.read(4096), b''):
+            while True:
+                chunk = dump_proc.stdout.read(4096)
+                if not chunk:
+                    break
                 memfile.write(chunk)
+            stderr_output.write(dump_proc.stderr.read())
 
             memfile.seek(0)
             blob.upload_from_file(memfile, content_type='application/octet-stream')
 
+        dump_proc.stdout.close()
+        dump_proc.stderr.close()
+
+        return_code = dump_proc.wait()
         elapsed_time = time.time() - start_time
+
+        if return_code != 0:
+            stderr_content = stderr_output.getvalue().decode('utf-8')
+            logging.error("Command failed with return code {}: {}".format(return_code, stderr_content))
+            log_to_file("Error details: {}".format(stderr_content))
+            return False
+
         logging.info("Dumped and streamed database {} to GCS successfully in {:.2f} seconds.".format(db, elapsed_time))
+        return True
 
     except Exception as e:
         logging.error("Unexpected error streaming database {} to GCS: {}".format(db, e))
+        return False
 
 def main():
     # Initialize the configuration parser and load the server configurations
