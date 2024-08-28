@@ -36,6 +36,14 @@ DB_ROLES = {
     "db_gtt_historic_data": "GenBackupUser"
 }
 
+# Initialize logging
+logging.basicConfig(
+    filename=LOG_FILE_PATH,
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+
 def log_to_file(message):
     """Write messages to the log file with a timestamp."""
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -68,8 +76,8 @@ def stream_database_to_gcs(dump_command, gcs_path, db):
 
         # Start the dump process
         dump_proc = subprocess.Popen(dump_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-        stderr_output = io.BytesIO()
+        
+        # Initialize Google Cloud Storage client
         client = storage.Client.from_service_account_json(KEY_FILE)
         bucket = client.bucket(BUCKET)
         blob = bucket.blob(gcs_path)
@@ -81,21 +89,18 @@ def stream_database_to_gcs(dump_command, gcs_path, db):
                 if not chunk:
                     break
                 memfile.write(chunk)
-            stderr_output.write(dump_proc.stderr.read())
 
             memfile.seek(0)
             blob.upload_from_file(memfile, content_type='application/octet-stream')
 
-        dump_proc.stdout.close()
-        dump_proc.stderr.close()
+        stderr_output = dump_proc.stderr.read().decode('utf-8')
+        dump_proc.wait()
 
-        return_code = dump_proc.wait()
         elapsed_time = time.time() - start_time
 
-        if return_code != 0:
-            stderr_content = stderr_output.getvalue().decode('utf-8')
-            logging.error("Command failed with return code {}: {}".format(return_code, stderr_content))
-            log_to_file("Error details: {}".format(stderr_content))
+        if dump_proc.returncode != 0:
+            logging.error("Command failed with return code {}: {}".format(dump_proc.returncode, stderr_output))
+            log_to_file("Error details: {}".format(stderr_output))
             return False
 
         logging.info("Dumped and streamed database {} to GCS successfully in {:.2f} seconds.".format(db, elapsed_time))
