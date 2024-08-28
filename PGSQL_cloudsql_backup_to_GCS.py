@@ -143,13 +143,25 @@ def main():
                 
                 if use_ssl:
                     dump_command = [
-                        "pg_dump", f"sslmode=verify-ca user={DB_USR} hostaddr={HOST} sslrootcert={SSL_PATH}/{SERVER}/server-ca.pem sslcert={SSL_PATH}/{SERVER}/client-cert.pem sslkey={SSL_PATH}/{SERVER}/client-key.pem dbname={db}",
-                        "--role=postgres", "--no-owner", "--no-acl", "-Fc"
+                        "pg_dump",
+                        "sslmode=verify-ca user={} hostaddr={} sslrootcert={} sslcert={} sslkey={} dbname={}".format(
+                            DB_USR, HOST, os.path.join(SSL_PATH, SERVER, "server-ca.pem"),
+                            os.path.join(SSL_PATH, SERVER, "client-cert.pem"),
+                            os.path.join(SSL_PATH, SERVER, "client-key.pem"), db
+                        ),
+                        "--role=postgres",
+                        "--no-owner",
+                        "--no-acl",
+                        "-Fc"
                     ]
                 else:
                     dump_command = [
-                        "pg_dump", f"postgresql://{DB_USR}:{DB_PWD}@{HOST}:5432/{db}",
-                        "--role=postgres", "--no-owner", "--no-acl", "-Fc"
+                        "pg_dump",
+                        "postgresql://{}:{}@{}:5432/{}".format(DB_USR, DB_PWD, HOST, db),
+                        "--role=postgres",
+                        "--no-owner",
+                        "--no-acl",
+                        "-Fc"
                     ]
 
                 logging.info("Dump command: {}".format(" ".join(dump_command)))
@@ -162,3 +174,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
